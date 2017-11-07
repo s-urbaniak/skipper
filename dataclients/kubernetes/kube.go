@@ -280,6 +280,11 @@ type Client struct {
 	ingressClass         *regexp.Regexp
 }
 
+type stickyWeight struct {
+	Weight float64 `json:"weight"`
+	Sticky string  `json:"sticky"`
+}
+
 var nonWord = regexp.MustCompile("\\W")
 
 var (
@@ -559,7 +564,22 @@ func (c *Client) convertPathRule(ns, name, host string, prule *pathRule, service
 			Name: traffic.PredicateName,
 			Args: []interface{}{prule.Backend.Traffic},
 		}}
+
+		if prule.Backend.Sticky != "" {
+			r.Predicates[0].Args = append(r.Predicates[0].Args, name, prule.Backend.ServiceName)
+		}
+
 		log.Debugf("Traffic weight %.2f for backend '%s'", prule.Backend.Traffic, prule.Backend.ServiceName)
+	}
+
+	if prule.Backend.Sticky != "" {
+		r.Filters = append(r.Filters, &eskip.Filter{
+			Name: prule.Backend.Sticky,
+			Args: []interface{}{
+				name,
+				prule.Backend.ServiceName,
+			},
+		})
 	}
 
 	return r, nil
@@ -602,10 +622,23 @@ func (c *Client) ingressToRoutes(items []*ingressItem) ([]*eskip.Route, error) {
 			annotationPredicate = val
 		}
 
-		// parse backend-weihgts annotation if it exists
+		// parse backend-weights annotation if it exists
 		var backendWeights map[string]float64
+		var backendStickyWeights map[string]stickyWeight
 		if backends, ok := i.Metadata.Annotations[backendWeightsAnnotationKey]; ok {
 			err := json.Unmarshal([]byte(backends), &backendWeights)
+
+			if err == nil {
+				backendStickyWeights := make(map[string]stickyWeight, len(backends))
+				for k, v := range backendWeights {
+					backendStickyWeights[k] = stickyWeight{
+						Weight: v,
+					}
+				}
+			} else {
+				err = json.Unmarshal([]byte(backends), &backendStickyWeights)
+			}
+
 			if err != nil {
 				log.Errorf("error while parsing backend-weights annotation: %v", err)
 			}
@@ -625,7 +658,7 @@ func (c *Client) ingressToRoutes(items []*ingressItem) ([]*eskip.Route, error) {
 			host := []string{"^" + strings.Replace(rule.Host, ".", "[.]", -1) + "$"}
 
 			// update Traffic field for each backend
-			computeBackendWeights(backendWeights, rule)
+			computeBackendWeights(backendStickyWeights, rule)
 
 			for _, prule := range rule.Http.Paths {
 				if prule.Backend.Traffic > 0 {
@@ -728,7 +761,7 @@ func catchAllRoutes(routes []*eskip.Route) bool {
 //      backend-3: 1.0
 //
 // where for a weight of 1.0 no Traffic predicate will be generated.
-func computeBackendWeights(backendWeights map[string]float64, rule *rule) {
+func computeBackendWeights(backendWeights map[string]stickyWeight, rule *rule) {
 	type sumCount struct {
 		sum   float64
 		count int
@@ -743,8 +776,8 @@ func computeBackendWeights(backendWeights map[string]float64, rule *rule) {
 			pathSumCount[path.Path] = sc
 		}
 
-		if weight, ok := backendWeights[path.Backend.ServiceName]; ok {
-			sc.sum += weight
+		if w, ok := backendWeights[path.Backend.ServiceName]; ok {
+			sc.sum += w.Weight
 		} else {
 			sc.count++
 		}
@@ -753,12 +786,13 @@ func computeBackendWeights(backendWeights map[string]float64, rule *rule) {
 	// calculate traffic weight for each backend
 	for _, path := range rule.Http.Paths {
 		if sc, ok := pathSumCount[path.Path]; ok {
-			if weight, ok := backendWeights[path.Backend.ServiceName]; ok {
-				path.Backend.Traffic = weight / sc.sum
+			if w, ok := backendWeights[path.Backend.ServiceName]; ok {
+				path.Backend.Traffic = w.Weight / sc.sum
 				// subtract weight from the sum in order to
 				// give subsequent backends a higher relative
 				// weight.
-				sc.sum -= weight
+				sc.sum -= w.Weight
+				path.Backend.Sticky = w.Sticky
 			} else if sc.sum == 0 && sc.count > 0 {
 				path.Backend.Traffic = 1.0 / float64(sc.count)
 			}

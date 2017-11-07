@@ -73,6 +73,7 @@ type backend struct {
 	ServicePort backendPort `json:"servicePort"`
 	// Traffic field used for custom traffic weights, but not part of the ingress spec.
 	Traffic float64
+	Sticky  string
 }
 
 type pathRule struct {
